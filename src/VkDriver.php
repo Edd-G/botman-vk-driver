@@ -4,6 +4,7 @@ namespace BotMan\Drivers\Vk;
 
 use BotMan\BotMan\Drivers\Events\GenericEvent;
 use BotMan\BotMan\Drivers\HttpDriver;
+use BotMan\BotMan\Interfaces\VerifiesService;
 use BotMan\BotMan\Messages\Incoming\Answer;
 use BotMan\BotMan\Messages\Incoming\IncomingMessage;
 use BotMan\BotMan\Messages\Outgoing\OutgoingMessage;
@@ -34,28 +35,64 @@ class VkDriver extends HttpDriver
         'message_edit',
         'message_reply',
     ];
+    const CONFIRMATION_EVENT = 'confirmation';
 
     protected $messages = [];
+    private static $one_time = false;
+
+    /**
+     * Convert a Question object into a valid
+     * quick reply response object.
+     *
+     * @param \BotMan\BotMan\Messages\Outgoing\Question $question
+     * @return array
+     */
+    private function convertQuestion(Question $question)
+    {
+        $replies = Collection::make($question->getButtons())->map(function ($button) {
+            if(isset($button['additional']['onetime'])) {
+                self::$one_time = true;
+                unset($button['additional']['onetime']);
+            }
+            $action = [
+                'action' => [
+                    'type' => 'text', 
+                    'payload' => json_encode(['command' => (string) $button['value']], JSON_UNESCAPED_UNICODE), 
+                    'label' => (string) $button['text']
+                ]
+            ];
+            return [
+                array_merge($action, $button['additional']),
+            ];
+        });
+        return $replies->toArray();
+    }
 
     public function buildPayload(Request $request)
     {
         $this->payload = new ParameterBag(json_decode($request->getContent(), true) ?? []);
         $this->event = Collection::make($this->payload->all());
         $this->config = Collection::make($this->config->get('vk', []));
-        if (($this->matchesRequest() || $this->hasMatchingEvent()) && $this->event->get('type') != 'confirmation') {
+        if (($this->matchesRequest() || $this->hasMatchingEvent()) && $this->event->get('type') != self::CONFIRMATION_EVENT) {
             $this->respondApiServer();
+        } elseif ($this->event->get('type') === self::CONFIRMATION_EVENT) {
+            $this->sendConfirmation();
         }
     }
 
     public function buildServicePayload($message, $matchingMessage, $additionalParameters = [])
     {
-        //TODO: Implement buttons and attachments features.
-        $payload = [
+        //TODO: Implement attachments features.
+        $payload = array_merge_recursive([
             'peer_id' => $matchingMessage->getSender(),
-        ];
+        ], $additionalParameters);
 
         if ($message instanceof Question) {
             $payload['message'] = $message->getText();
+            $payload['keyboard'] = json_encode([
+                'buttons' => $this->convertQuestion($message),
+                'one_time' => self::$one_time,
+            ], JSON_UNESCAPED_UNICODE);
         } elseif ($message instanceof OutgoingMessage) {
             $payload['message'] = $message->getText();
         } else {
@@ -67,7 +104,17 @@ class VkDriver extends HttpDriver
 
     public function getConversationAnswer(IncomingMessage $message)
     {
-        // TODO: Implement interactive features.
+        $object = $this->event->get('object');
+        
+        if (isset($object['payload'])) {
+            $callback = json_decode($object['payload'], true);
+            if (isset($callback['command'])) {
+                return Answer::create($object['text'])
+                    ->setInteractiveReply(true)
+                    ->setMessage($message)
+                    ->setValue($callback['command']);
+            }
+        }
         return Answer::create($message->getText())->setMessage($message);
     }
 
@@ -77,6 +124,20 @@ class VkDriver extends HttpDriver
             $this->loadMessages();
         }
         return $this->messages;
+    }
+
+    protected function loadMessages()
+    {
+        $message = $this->event->get('object');
+
+        // Handle payload command from VK
+        if (isset($message['payload'])) {
+            $callback = json_decode($message['payload'], true);
+            $messagetext = isset($callback['command']) ? $callback['command'] : $message['text'];
+        } else {
+            $messagetext = $message['text'];
+        }
+        $this->messages = [new IncomingMessage($messagetext, $message['from_id'], $message['peer_id'], $this->event->toArray())];
     }
 
     public function getUser(IncomingMessage $matchingMessage)
@@ -102,7 +163,8 @@ class VkDriver extends HttpDriver
     public function hasMatchingEvent()
     {
         if(!$this->requestAuthenticated()) {
-            return false;
+            //return false;
+            $this->respondApiServer();
         }
         $event = false;
 
@@ -126,13 +188,6 @@ class VkDriver extends HttpDriver
         return !empty($this->config->get('access_token')) && !empty($this->config->get('api_version'));
     }
 
-    protected function loadMessages()
-    {
-        $message = $this->event->get('object');
-
-        $this->messages = [new IncomingMessage($message['text'], $message['from_id'], $message['peer_id'], $this->event->toArray())];
-    }
-
     public function matchesRequest()
     {
         return ($this->event->get('type') == 'message_new') && !isset($this->event->toArray()['object']['action']) && $this->requestAuthenticated();
@@ -149,7 +204,15 @@ class VkDriver extends HttpDriver
 
     public function requestAuthenticated()
     {
-        return empty($this->config->get('secret_key')) || ($this->config->get('secret_key') == $this->event->get('secret'));
+        return ($this->config->get('secret_key') == $this->event->get('secret'));
+    }
+
+
+    public function sendConfirmation()
+    {
+        if ($this->event->get('group_id') == $this->config->get('group_id')) {
+            exit($this->config->get('confirmation'));
+        }
     }
 
     public function sendPayload($payload)
@@ -164,4 +227,5 @@ class VkDriver extends HttpDriver
         $parameters['lang'] = $this->config->get('lang');
         return $this->http->post(self::API_URL . $endpoint, [], $parameters);
     }
+
 }
