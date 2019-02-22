@@ -4,7 +4,6 @@ namespace BotMan\Drivers\Vk;
 
 use BotMan\BotMan\Drivers\Events\GenericEvent;
 use BotMan\BotMan\Drivers\HttpDriver;
-use BotMan\BotMan\Interfaces\VerifiesService;
 use BotMan\BotMan\Messages\Incoming\Answer;
 use BotMan\BotMan\Messages\Incoming\IncomingMessage;
 use BotMan\BotMan\Messages\Outgoing\OutgoingMessage;
@@ -75,7 +74,7 @@ class VkDriver extends HttpDriver
         $this->config = Collection::make($this->config->get('vk', []));
         if (($this->matchesRequest() || $this->hasMatchingEvent()) && $this->event->get('type') != self::CONFIRMATION_EVENT) {
             $this->respondApiServer();
-        } elseif ($this->event->get('type') === self::CONFIRMATION_EVENT) {
+        } elseif ($this->event->get('type') === self::CONFIRMATION_EVENT && $this->requestAuthenticated()) {
             $this->sendConfirmation();
         }
     }
@@ -144,7 +143,7 @@ class VkDriver extends HttpDriver
     {
         $payload = [
             'user_ids' => $matchingMessage->getSender(),
-            'fields' => 'screen_name'
+            'fields' => 'screen_name, city, contacts'
         ];
 
         $response = $this->sendRequest('users.get', $payload, new IncomingMessage('', '', ''));
@@ -157,14 +156,13 @@ class VkDriver extends HttpDriver
         }
         $user = $responseData['response'][0];
 
-        return new User($user['id'], $user['first_name'], $user['last_name'], $user['screen_name']);
+        return new User($user['id'], $user['first_name'], $user['last_name'], $user['screen_name'], $user);
     }
 
     public function hasMatchingEvent()
     {
         if(!$this->requestAuthenticated()) {
-            //return false;
-            $this->respondApiServer();
+            return false;
         }
         $event = false;
 
