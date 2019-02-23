@@ -4,17 +4,20 @@ namespace BotMan\Drivers\Vk;
 
 use BotMan\BotMan\Drivers\Events\GenericEvent;
 use BotMan\BotMan\Drivers\HttpDriver;
+use BotMan\BotMan\Interfaces\VerifiesService;
 use BotMan\BotMan\Messages\Incoming\Answer;
 use BotMan\BotMan\Messages\Incoming\IncomingMessage;
 use BotMan\BotMan\Messages\Outgoing\OutgoingMessage;
 use BotMan\BotMan\Messages\Outgoing\Question;
+//use BotMan\BotMan\Storages\Storage;
 use BotMan\BotMan\Users\User;
 use BotMan\Drivers\Vk\Exceptions\VkException;
 use Illuminate\Support\Collection;
 use Symfony\Component\HttpFoundation\ParameterBag;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
 
-class VkDriver extends HttpDriver
+class VkDriver extends HttpDriver implements VerifiesService
 {
     const DRIVER_NAME = 'Vk';
     const API_URL = 'https://api.vk.com/method/';
@@ -30,14 +33,25 @@ class VkDriver extends HttpDriver
         'chat_title_update',
         'chat_unpin_message',
         'message_allow',
-        'message_deny',
         'message_edit',
         'message_reply',
+    ];
+    const ACTION_EVENTS = [ // Not used yet
+        'message_deny', // Watch users deny message
+        'message_new', // Watch incoming message
     ];
     const CONFIRMATION_EVENT = 'confirmation';
 
     protected $messages = [];
     private static $one_time = false;
+
+    
+    // TODO: implement MUTE bot if group admin's write message in conversation
+    // for that, store mute timer in cache
+    // private function saveStorage($data)
+    // {
+    //        
+    // }
 
     /**
      * Convert a Question object into a valid
@@ -69,14 +83,11 @@ class VkDriver extends HttpDriver
 
     public function buildPayload(Request $request)
     {
-        $this->payload = new ParameterBag(json_decode($request->getContent(), true) ?? []);
+        $this->payload = new ParameterBag((array) json_decode($request->getContent(), true) ?? []);
         $this->event = Collection::make($this->payload->all());
         $this->config = Collection::make($this->config->get('vk', []));
-        if (($this->matchesRequest() || $this->hasMatchingEvent()) && $this->event->get('type') != self::CONFIRMATION_EVENT) {
-            $this->respondApiServer();
-        } elseif ($this->event->get('type') === self::CONFIRMATION_EVENT && $this->requestAuthenticated()) {
-            $this->sendConfirmation();
-        }
+        $this->queryParameters = Collection::make($request->query);
+        $this->content = $request->getContent();
     }
 
     public function buildServicePayload($message, $matchingMessage, $additionalParameters = [])
@@ -129,12 +140,18 @@ class VkDriver extends HttpDriver
     {
         $message = $this->event->get('object');
 
-        // Handle payload command from VK
+        // Handle payload command from VK. (buttons payload)
         if (isset($message['payload'])) {
             $callback = json_decode($message['payload'], true);
             $messagetext = isset($callback['command']) ? $callback['command'] : $message['text'];
-        } else {
+        } elseif (isset($message['text'])) {
             $messagetext = $message['text'];
+        // If user deny recive message - pass this to bot logic
+        // TODO: add config
+        } elseif ($this->event->get('type') == 'message_deny') {
+            $messagetext = '_message_deny';
+            $message['from_id'] = $message['user_id'];
+            $message['peer_id'] = $message['user_id'];
         }
         $this->messages = [new IncomingMessage($messagetext, $message['from_id'], $message['peer_id'], $this->event->toArray())];
     }
@@ -177,7 +194,6 @@ class VkDriver extends HttpDriver
             $event = new GenericEvent($chatAction->except('type'));
             $event->setName($this->event->toArray()['object']['action']['type']);
         }
-
         return $event;
     }
 
@@ -188,16 +204,19 @@ class VkDriver extends HttpDriver
 
     public function matchesRequest()
     {
-        return ($this->event->get('type') == 'message_new') && !isset($this->event->toArray()['object']['action']) && $this->requestAuthenticated();
+        //TODO: move attachments check to file driver
+        //$noAttachments = isset($this->event->toArray()['object']['attachments']) ?
+        $matches = (!is_null($this->event->get('type')) || !is_null($this->event->get('object'))) && !is_null($this->event->get('group_id')) && $this->requestAuthenticated();
+        if ($matches && $this->event->get('type') != self::CONFIRMATION_EVENT)
+        {
+            $this->respondApiServer();
+        }
+        return $matches;
     }
 
-    protected function respondApiServer()
+    private function respondApiServer()
     {
-        static $responseSent = false;
-        if (!$responseSent) {
-            echo 'ok';
-            $responseSent = true;
-        }
+        echo 'ok';
     }
 
     public function requestAuthenticated()
@@ -205,12 +224,31 @@ class VkDriver extends HttpDriver
         return ($this->config->get('secret_key') == $this->event->get('secret'));
     }
 
-
-    public function sendConfirmation()
+    /**
+     * @param Request $request
+     * @return Response|null
+     */
+    public function verifyRequest(Request $request)
     {
-        if ($this->event->get('group_id') == $this->config->get('group_id')) {
-            exit($this->config->get('confirmation'));
+        if ($this->payload->get('type') === self::CONFIRMATION_EVENT &&
+            $this->payload->get('group_id') == $this->config->get('group_id')) {
+            return Response::create($this->config->get('confirmation'))->send();
         }
+        return null;
+    }
+
+    /**
+     * @param IncomingMessage $matchingMessage
+     * @return \Symfony\Component\HttpFoundation\Response
+     */
+    public function types(IncomingMessage $matchingMessage)
+    {
+        $parameters = [
+            'user_id' => $this->config->get('group_id'),
+            'type' => 'typing',
+            'peer_id' => $matchingMessage->getSender(),
+        ];
+        return $this->sendRequest('messages.setActivity', $parameters, new IncomingMessage('', '', ''));
     }
 
     public function sendPayload($payload)
@@ -225,5 +263,4 @@ class VkDriver extends HttpDriver
         $parameters['lang'] = $this->config->get('lang');
         return $this->http->post(self::API_URL . $endpoint, [], $parameters);
     }
-
 }
